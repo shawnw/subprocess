@@ -4,6 +4,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <new>
@@ -12,6 +13,13 @@
 #include <string>
 #include <tuple>
 #include <vector>
+
+#if __has_include(<experimental/future>)
+#include <experimental/future>
+#if __cpp_lib_experimental_future_continuations >= 201505
+#define USE_CONCURRENCY_TS
+#endif
+#endif
 
 extern "C"
 {
@@ -504,15 +512,78 @@ void link(ipipe_descriptor& fd1, opipe_descriptor& fd2)
   fd2.linked_fd_ = &fd1;
 }
 
+/**
+ * @brief Results of command execution
+ *
+ * Get exit status information from a finished command.
+ */
+class process_status_code
+{
+public:
+  virtual ~process_status_code() {}
+
+  /** @brief Return true if command exited normally. */
+  virtual bool exited() const noexcept = 0;
+
+  /** @brief Return the exit status of the command.
+   *
+   *  If the command didn't exit normally, returns an empty optional.
+   */
+  virtual std::optional<int> exit_status() const noexcept = 0;
+
+  /** @brief Return true if the command exited because of a signal. */
+  virtual bool signaled() const noexcept = 0;
+
+  /** @brief Return the signal that killed the process.
+   *
+   * If the command wasn't killed by a signal, returns an empty optional.
+   */
+  virtual std::optional<int> exit_signal() const noexcept = 0;
+};
+
+using status_code = std::unique_ptr<process_status_code>;
+
+class posix_status : public process_status_code
+{
+public:
+  posix_status(int status_) : wstatus(status_) {}
+
+  bool exited() const noexcept override { return WIFEXITED(wstatus); }
+  std::optional<int> exit_status() const noexcept override
+  {
+    if (WIFEXITED(wstatus))
+    {
+      return std::optional<int>(WEXITSTATUS(wstatus));
+    }
+    else
+    {
+      return std::optional<int>();
+    }
+  }
+  bool signaled() const noexcept override { return WIFSIGNALED(wstatus); }
+  std::optional<int> exit_signal() const noexcept override
+  {
+    if (WIFSIGNALED(wstatus))
+    {
+      return std::optional<int>(WTERMSIG(wstatus));
+    }
+    else
+    {
+      return std::optional<int>();
+    }
+  }
+
+private:
+  int wstatus;
+};
+
 class posix_process
 {
 
 public:
   posix_process(std::string cmd) : cmd_{std::move(cmd)} {}
 
-  void execute();
-
-  int wait();
+  std::future<status_code> execute(std::launch policy = std::launch::async);
 
   const descriptor& in() { return *stdin_fd; }
 
@@ -527,10 +598,9 @@ public:
 private:
   std::string cmd_;
   descriptor_ptr_t stdin_fd{subprocess::in()}, stdout_fd{subprocess::out()}, stderr_fd{subprocess::err()};
-  std::optional<int> pid_;
 };
 
-void posix_process::execute()
+std::future<status_code> posix_process::execute(std::launch policy)
 {
   auto dup_and_close = [](posix_spawn_file_actions_t* action, descriptor_ptr_t& fd, const descriptor& dup_to)
   {
@@ -552,21 +622,20 @@ void posix_process::execute()
     throw exceptions::os_error{"Failed to spawn process"};
   }
   posix_spawn_file_actions_destroy(&action);
-  pid_ = pid;
   stdin_fd->close();
   stdout_fd->close();
   stderr_fd->close();
-}
 
-int posix_process::wait()
-{
-  if (not pid_)
-  {
-    throw exceptions::usage_error{"posix_process.wait() called before posix_process.execute()"};
-  }
-  int waitstatus;
-  ::waitpid(*(pid_), &waitstatus, 0);
-  return waitstatus;
+  return std::async(policy,
+                    [pid]() -> status_code
+                    {
+                      int waitstatus;
+                      if (::waitpid(pid, &waitstatus, 0) < 0)
+                      {
+                        throw exceptions::os_error{"waitpid"};
+                      }
+                      return std::make_unique<posix_status>(waitstatus);
+                    });
 }
 
 using process = posix_process;
@@ -593,9 +662,9 @@ public:
    * It can also throw subprocess::os_error if the command could not be
    * run due to some operating system level restrictions/errors.
    *
-   * @return int Return code from the pipeline
+   * @return int Return exit status from the last command in the pipeline.
    */
-  int run();
+  status_code run();
 
   /**
    * @brief Runs the command pipeline and doesn't throw.
@@ -606,9 +675,9 @@ public:
    * However, it can still throw subprocess::os_error in case of
    * operating system level restrictions/errors.
    *
-   * @return int Return code from the pipeline
+   * @return int Return exit status from the last command in the pipeline.
    */
-  int run(std::nothrow_t);
+  status_code run(std::nothrow_t);
 
   /**
    * @brief Chains a command object to the current one.
@@ -663,25 +732,42 @@ private:
   friend command&& operator>>=(command&& cmd, const std::filesystem::path& file_name);
 };
 
-int command::run(std::nothrow_t)
+status_code command::run(std::nothrow_t)
 {
+  std::vector<std::future<status_code>> procs;
   for (auto& process : processes)
   {
-    process.execute();
+    procs.emplace_back(process.execute(std::launch::deferred));
   }
-  int waitstatus;
-  for (auto& process : processes)
+#ifdef USE_CONCURRENCY_TS
+  auto statuses = std::experimental::when_all(procs.begin(), procs.end());
+  statuses.wait();
+  return statuses.get().back();
+#else
+  for (auto& fut : procs)
   {
-    waitstatus = process.wait();
+    fut.wait();
   }
-  return WEXITSTATUS(waitstatus);
+  return procs.back().get();
+#endif
 }
 
-int command::run()
+status_code command::run()
 {
-  if (int status{run(std::nothrow)}; status != 0)
+  if (auto status{run(std::nothrow)}; status->exit_status().value_or(-1) != 0)
   {
-    throw exceptions::command_error{"Command exited with code " + std::to_string(status) + ".", status};
+    if (status->exited())
+    {
+      throw exceptions::command_error{"Command exited with code " +
+                                          std::to_string(status->exit_status().value()) + ".",
+                                      status->exit_status().value()};
+    }
+    else
+    {
+      throw exceptions::command_error{"Command terminated by signal " +
+                                          std::to_string(status->exit_signal().value()) + ".",
+                                      status->exit_signal().value()};
+    }
   }
   else
   {
